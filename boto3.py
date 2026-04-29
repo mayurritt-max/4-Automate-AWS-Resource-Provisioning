@@ -1,184 +1,148 @@
 import boto3
 import time
+import os
 
-region = "ap-south-1"
-
-ec2 = boto3.client('ec2', region_name=region)
-elbv2 = boto3.client('elbv2', region_name=region)
-rds = boto3.client('rds', region_name=region)
-
-# 🔹 YOUR VALUES (UPDATED)
+# -----------------------------
+# CONFIG (YOUR VALUES)
+# -----------------------------
+REGION = "ap-south-1"
+BUCKET_NAME = "mayur-auto-bucket-98765432111"   # CHANGE if error (must be unique)
 KEY_NAME = "mayur2777"
-DB_PASSWORD = "Mayur123!"
-VPC_ID = "vpc-0d6d9f78d366471c0"
-SUBNETS = ["subnet-099363d6c6c16971b", "subnet-0374f6a4c502b68b0"]
-AMI_ID = "ami-05d2d839d4f73aafb"
+SECURITY_GROUP_NAME = "mayurr-sg"
+AMI_ID = "ami-0e12ffc2dd465f6e4"
+INSTANCE_TYPE = "t3.micro"
 
-# -------------------------------
-# 1️⃣ CREATE SECURITY GROUPS
-# -------------------------------
+# -----------------------------
+# CLIENTS
+# -----------------------------
+ec2 = boto3.client('ec2', region_name=REGION)
+s3 = boto3.client('s3', region_name=REGION)
 
-def create_sg(name, desc):
-    sg = ec2.create_security_group(
-        GroupName=name,
-        Description=desc,
-        VpcId=VPC_ID
+# -----------------------------
+# 1. CREATE S3 BUCKET
+# -----------------------------
+def create_bucket():
+    try:
+        print("Creating S3 bucket...")
+        s3.create_bucket(
+            Bucket=BUCKET_NAME,
+            CreateBucketConfiguration={'LocationConstraint': REGION}
+        )
+        print("✅ S3 Bucket Created")
+    except Exception as e:
+        print("⚠️ Bucket issue:", e)
+
+# -----------------------------
+# 2. CREATE KEY PAIR (ONLY IF NOT EXISTS)
+# -----------------------------
+def create_keypair():
+    try:
+        print("Checking/Creating Key Pair...")
+        response = ec2.create_key_pair(KeyName=KEY_NAME)
+
+        with open(KEY_NAME + ".pem", "w") as f:
+            f.write(response['KeyMaterial'])
+
+        os.chmod(KEY_NAME + ".pem", 0o400)
+        print("✅ Key Pair Created & Saved")
+    except Exception:
+        print("⚠️ Key already exists, skipping...")
+
+# -----------------------------
+# 3. CREATE SECURITY GROUP
+# -----------------------------
+def create_security_group():
+    print("Creating Security Group...")
+
+    vpc_id = ec2.describe_vpcs()['Vpcs'][0]['VpcId']
+
+    try:
+        response = ec2.create_security_group(
+            GroupName=SECURITY_GROUP_NAME,
+            Description='Allow HTTP & SSH',
+            VpcId=vpc_id
+        )
+        sg_id = response['GroupId']
+
+        ec2.authorize_security_group_ingress(
+            GroupId=sg_id,
+            IpPermissions=[
+                {
+                    'IpProtocol': 'tcp',
+                    'FromPort': 22,
+                    'ToPort': 22,
+                    'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                },
+                {
+                    'IpProtocol': 'tcp',
+                    'FromPort': 80,
+                    'ToPort': 80,
+                    'IpRanges': [{'CidrIp': '0.0.0.0/0'}]
+                }
+            ]
+        )
+
+        print("✅ Security Group Created:", sg_id)
+        return sg_id
+
+    except Exception:
+        print("⚠️ SG exists, fetching existing...")
+
+        groups = ec2.describe_security_groups(GroupNames=[SECURITY_GROUP_NAME])
+        return groups['SecurityGroups'][0]['GroupId']
+
+# -----------------------------
+# 4. LAUNCH EC2
+# -----------------------------
+def launch_instance(sg_id):
+    print("Launching EC2...")
+
+    user_data = '''#!/bin/bash
+    yum update -y
+    yum install -y httpd
+    systemctl start httpd
+    systemctl enable httpd
+    echo "Hello Mayur 🚀 from t3.micro" > /var/www/html/index.html
+    '''
+
+    response = ec2.run_instances(
+        ImageId=AMI_ID,
+        InstanceType=INSTANCE_TYPE,
+        KeyName=KEY_NAME,
+        SecurityGroupIds=[sg_id],
+        MinCount=1,
+        MaxCount=1,
+        UserData=user_data
     )
-    sg_id = sg['GroupId']
 
-    ec2.authorize_security_group_ingress(
-        GroupId=sg_id,
-        IpPermissions=[
-            {'IpProtocol': 'tcp', 'FromPort': 80, 'ToPort': 80,
-             'IpRanges': [{'CidrIp': '0.0.0.0/0'}]},
-            {'IpProtocol': 'tcp', 'FromPort': 22, 'ToPort': 22,
-             'IpRanges': [{'CidrIp': '0.0.0.0/0'}]}
-        ]
-    )
-    return sg_id
+    instance_id = response['Instances'][0]['InstanceId']
+    print("✅ Instance ID:", instance_id)
+    return instance_id
 
-frontend_sg = create_sg("frontend-sg", "Frontend SG")
-backend_sg = create_sg("backend-sg", "Backend SG")
-db_sg = create_sg("db-sg", "DB SG")
+# -----------------------------
+# 5. GET PUBLIC IP
+# -----------------------------
+def get_ip(instance_id):
+    print("Waiting for instance to run...")
 
+    waiter = ec2.get_waiter('instance_running')
+    waiter.wait(InstanceIds=[instance_id])
 
-print("✅ Security Groups created")
+    desc = ec2.describe_instances(InstanceIds=[instance_id])
+    ip = desc['Reservations'][0]['Instances'][0]['PublicIpAddress']
 
-# -------------------------------
-# 2️⃣ CREATE RDS
-# -------------------------------
+    print("\n🌐 WEBSITE READY:")
+    print(f"http://{ip}")
 
-print("⏳ Creating RDS...")
+# -----------------------------
+# MAIN
+# -----------------------------
+def main():
+    create_bucket()
+    create_keypair()
+    sg_id = create_security_group()
+    instance_id = launch_instance(sg_id)
+    get_ip(instance_id)
 
-rds.create_db_instance(
-    DBInstanceIdentifier='mydb',
-    AllocatedStorage=20,
-    DBName='mydb',
-    Engine='mysql',
-    MasterUsername='admin',
-    MasterUserPassword=DB_PASSWORD,
-    DBInstanceClass='db.t3.micro',
-    VpcSecurityGroupIds=[db_sg],
-    PubliclyAccessible=True
-)
-
-print("⏳ Waiting for DB (5 min)...")
-time.sleep(300)
-
-# -------------------------------
-# 3️⃣ BACKEND EC2
-# -------------------------------
-
-backend_user_data = """#!/bin/bash
-yum update -y
-yum install python3 -y
-pip3 install flask
-
-cat <<EOF > app.py
-from flask import Flask
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Backend Running 🚀"
-
-app.run(host='0.0.0.0', port=5000)
-EOF
-
-python3 app.py &
-"""
-
-backend = ec2.run_instances(
-    ImageId=AMI_ID,
-    InstanceType='t3.micro',   # ✅ CHANGED
-    KeyName=KEY_NAME,
-    MinCount=1,
-    MaxCount=1,
-    SecurityGroupIds=[backend_sg],
-    SubnetId=SUBNETS[0],
-    UserData=backend_user_data
-)
-
-backend_id = backend['Instances'][0]['InstanceId']
-print("✅ Backend Instance:", backend_id)
-
-# -------------------------------
-# 4️⃣ FRONTEND EC2
-# -------------------------------
-
-frontend_user_data = """#!/bin/bash
-yum update -y
-yum install nginx -y
-systemctl start nginx
-
-echo "Frontend Working 🚀" > /usr/share/nginx/html/index.html
-"""
-
-frontend = ec2.run_instances(
-    ImageId=AMI_ID,
-    InstanceType='t3.micro',   # ✅ CHANGED
-    KeyName=KEY_NAME,
-    MinCount=1,
-    MaxCount=1,
-    SecurityGroupIds=[frontend_sg],
-    SubnetId=SUBNETS[1],
-    UserData=frontend_user_data
-)
-
-frontend_id = frontend['Instances'][0]['InstanceId']
-print("✅ Frontend Instance:", frontend_id)
-
-time.sleep(60)
-
-# -------------------------------
-# 5️⃣ CREATE ALB
-# -------------------------------
-
-lb = elbv2.create_load_balancer(
-    Name='mayur-alb',
-    Subnets=SUBNETS,
-    SecurityGroups=[frontend_sg],
-    Scheme='internet-facing',
-    Type='application'
-)
-
-lb_arn = lb['LoadBalancers'][0]['LoadBalancerArn']
-dns = lb['LoadBalancers'][0]['DNSName']
-
-print("🌐 ALB DNS:", dns)
-
-# -------------------------------
-# 6️⃣ TARGET GROUP
-# -------------------------------
-
-tg = elbv2.create_target_group(
-    Name='mayur-tg',
-    Protocol='HTTP',
-    Port=80,
-    VpcId=VPC_ID,
-    TargetType='instance'
-)
-
-tg_arn = tg['TargetGroups'][0]['TargetGroupArn']
-
-elbv2.register_targets(
-    TargetGroupArn=tg_arn,
-    Targets=[{'Id': frontend_id}]
-)
-
-# -------------------------------
-# 7️⃣ LISTENER
-# -------------------------------
-
-elbv2.create_listener(
-    LoadBalancerArn=lb_arn,
-    Protocol='HTTP',
-    Port=80,
-    DefaultActions=[{
-        'Type': 'forward',
-        'TargetGroupArn': tg_arn
-    }]
-)
-
-print("🎉 DEPLOYMENT COMPLETE")
-print("👉 Open in browser:", dns) 
+if __name__ == "__main__":
+    main()
